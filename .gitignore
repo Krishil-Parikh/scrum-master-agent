@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# aamt runtime state (project DB, event log, cloned workspaces, generated reports)
+.aamt/
+.smoketest*/

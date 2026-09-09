@@ -1,0 +1,44 @@
+[project]
+name = "aamt"
+version = "0.1.0"
+description = "Autonomous Agile Multi-Agent Software Engineering Team"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=0.2.60",
+    "langgraph-checkpoint-sqlite>=2.0.1",
+    "langchain>=0.3.14",
+    "langchain-core>=0.3.29",
+    "langchain-anthropic>=0.3.1",
+    "langchain-openai>=0.2.14",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.7.0",
+    "python-dotenv>=1.0.1",
+    "typer>=0.15.1",
+    "rich>=13.9.4",
+    "textual>=1.0.0",
+    "psutil>=6.1.0",
+    "pyfiglet>=1.0.2",
+]
+
+[project.scripts]
+aamt = "aamt.cli:app"
+aamt-tui = "aamt.tui.app:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.4",
+    "pytest-asyncio>=0.25.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aamt"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+asyncio_mode = "auto"
