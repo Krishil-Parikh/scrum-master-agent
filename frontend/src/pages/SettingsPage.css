@@ -1,0 +1,50 @@
+.settings-page {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+.settings-card-wide {
+  grid-column: 1 / -1;
+}
+
+@media (max-width: 800px) {
+  .settings-page {
+    grid-template-columns: 1fr;
+  }
+}
+
+.settings-body {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12.5px;
+  color: var(--text-secondary);
+}
+.settings-row code {
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: var(--bg-input);
+  padding: 2px 7px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  max-width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-note {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  margin-top: 4px;
+}

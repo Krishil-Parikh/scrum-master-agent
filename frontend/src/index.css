@@ -1,0 +1,379 @@
+/* =========================================================================
+   AI Dev Pod -- design tokens + global styles
+
+   One hand-written stylesheet rather than a utility framework: the app is
+   small and the visual language (a dark engineering dashboard) is stable
+   enough that plain, well-organized CSS stays easier to reason about than
+   a build-time utility pipeline. Sectioned by concern below; component-
+   specific rules live in the matching component's own .css file next to it
+   (imported from that component) for anything non-trivial, and shared
+   primitives (buttons, badges, cards, scrollbars) live here.
+   ========================================================================= */
+
+:root {
+  /* Surfaces */
+  --bg-app: #0a0c11;
+  --bg-panel: #12151d;
+  --bg-panel-raised: #171b25;
+  --bg-hover: #1c212c;
+  --bg-input: #0e1117;
+  --border: #242938;
+  --border-soft: #1c212c;
+
+  /* Text */
+  --text-primary: #eef0f4;
+  --text-secondary: #9aa1b3;
+  --text-muted: #6b7280;
+
+  /* Accent */
+  --accent-blue: #4c6ef5;
+  --accent-blue-soft: rgba(76, 110, 245, 0.14);
+  --accent-green: #37b24d;
+  --accent-green-soft: rgba(55, 178, 77, 0.14);
+  --accent-red: #f03e3e;
+  --accent-red-soft: rgba(240, 62, 62, 0.14);
+  --accent-orange: #f76707;
+  --accent-purple: #ae3ec9;
+  --accent-pink: #e64980;
+  --accent-amber: #f59f00;
+  --accent-cyan: #22b8cf;
+
+  /* Chrome */
+  --sidebar-width: 232px;
+  --topbar-height: 64px;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --shadow-panel: 0 1px 0 rgba(255, 255, 255, 0.02) inset, 0 8px 24px rgba(0, 0, 0, 0.25);
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg-app);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+
+button,
+input,
+textarea,
+select {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+/* Scrollbars -- unobtrusive, dark-theme consistent */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #2a3040 transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: #2a3040;
+  border-radius: 8px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* =========================================================================
+   Primitives
+   ========================================================================= */
+
+.panel {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-panel);
+}
+
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.panel-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.panel-title svg {
+  color: var(--accent-blue);
+  flex-shrink: 0;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-panel-raised);
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease, opacity 0.12s ease;
+  white-space: nowrap;
+}
+.btn:hover {
+  background: var(--bg-hover);
+}
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.btn-primary {
+  background: var(--accent-blue);
+  border-color: var(--accent-blue);
+  color: white;
+}
+.btn-primary:hover {
+  background: #3f5ce0;
+}
+.btn-danger {
+  background: var(--accent-red);
+  border-color: var(--accent-red);
+  color: white;
+}
+.btn-danger:hover {
+  background: #d92b2b;
+}
+.btn-ghost {
+  background: transparent;
+  border-color: transparent;
+}
+.btn-ghost:hover {
+  background: var(--bg-hover);
+}
+.btn-sm {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  white-space: nowrap;
+}
+.badge-blue {
+  background: var(--accent-blue-soft);
+  color: #8fa4ff;
+}
+.badge-green {
+  background: var(--accent-green-soft);
+  color: #69db7c;
+}
+.badge-red {
+  background: var(--accent-red-soft);
+  color: #ff8787;
+}
+.badge-neutral {
+  background: var(--bg-hover);
+  color: var(--text-secondary);
+}
+.badge-amber {
+  background: rgba(245, 159, 0, 0.14);
+  color: #ffd43b;
+}
+.badge-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--text-muted);
+}
+.status-dot.online {
+  background: var(--accent-green);
+  box-shadow: 0 0 0 3px var(--accent-green-soft);
+}
+
+.avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  font-size: 11px;
+  font-weight: 700;
+  color: white;
+  flex-shrink: 0;
+}
+
+.input {
+  width: 100%;
+  padding: 9px 12px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  outline: none;
+  transition: border-color 0.12s ease;
+}
+.input:focus {
+  border-color: var(--accent-blue);
+}
+.input::placeholder {
+  color: var(--text-muted);
+}
+
+.progress-track {
+  width: 100%;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--bg-hover);
+  overflow: hidden;
+}
+.progress-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent-blue), var(--accent-cyan));
+  transition: width 0.4s ease;
+}
+
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 48px 24px;
+  color: var(--text-secondary);
+  text-align: center;
+}
+.empty-state svg {
+  color: var(--text-muted);
+}
+
+.form-label {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+
+.form-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.form-error {
+  margin-top: 10px;
+  padding: 10px 12px;
+  background: var(--accent-red-soft);
+  border: 1px solid rgba(240, 62, 62, 0.35);
+  border-radius: var(--radius-sm);
+  color: #ff8787;
+  font-size: 12.5px;
+}
+
+/* =========================================================================
+   App shell
+   ========================================================================= */
+
+.app-shell {
+  display: grid;
+  grid-template-columns: var(--sidebar-width) 1fr;
+  grid-template-rows: 100vh;
+}
+
+.app-main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  height: 100vh;
+}
+
+.app-content {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 20px;
+}
+
+@media (max-width: 860px) {
+  .app-shell {
+    grid-template-columns: 1fr;
+  }
+}
+
+.app-boot-loading {
+  height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-secondary);
+  font-size: 14px;
+}
+
+.app-boot-error {
+  max-width: 560px;
+  margin: 15vh auto 0;
+  padding: 24px 28px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+.app-boot-error h2 {
+  margin-top: 0;
+  color: #ff8787;
+}
+.app-boot-error code {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}

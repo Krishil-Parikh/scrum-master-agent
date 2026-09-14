@@ -1,0 +1,85 @@
+.agile-board {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(220px, 1fr));
+  gap: 12px;
+  overflow-x: auto;
+  padding-bottom: 8px;
+}
+
+@media (max-width: 1400px) {
+  .agile-board {
+    grid-template-columns: repeat(3, minmax(240px, 1fr));
+  }
+}
+@media (max-width: 760px) {
+  .agile-board {
+    grid-template-columns: minmax(240px, 1fr);
+  }
+}
+
+.agile-column {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  display: flex;
+  flex-direction: column;
+  min-height: 200px;
+}
+
+.agile-column-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--text-secondary);
+}
+
+.agile-column-body {
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1;
+}
+
+.agile-column-empty {
+  color: var(--text-muted);
+  font-size: 12px;
+  text-align: center;
+  padding: 12px 0;
+}
+
+.agile-card {
+  background: var(--bg-panel-raised);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  padding: 10px;
+}
+
+.agile-card-epic {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  margin-bottom: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agile-card-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.agile-card-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}

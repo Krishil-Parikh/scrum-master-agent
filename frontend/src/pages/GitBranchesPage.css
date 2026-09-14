@@ -1,0 +1,76 @@
+.git-page {
+  display: grid;
+  grid-template-columns: 260px 1fr;
+  gap: 16px;
+  align-items: start;
+}
+
+@media (max-width: 800px) {
+  .git-page {
+    grid-template-columns: 1fr;
+  }
+}
+
+.git-branch-list,
+.git-commit-list {
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.git-branch-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  border-radius: var(--radius-sm);
+}
+.git-branch-row:hover {
+  background: var(--bg-hover);
+}
+
+.git-branch-name {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.git-branch-agent {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.git-commit-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 9px 8px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.git-commit-row:last-child {
+  border-bottom: none;
+}
+
+.git-commit-body {
+  min-width: 0;
+}
+
+.git-commit-subject {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.git-commit-meta {
+  display: flex;
+  gap: 10px;
+  margin-top: 3px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.git-commit-sha {
+  font-family: var(--font-mono);
+  color: var(--accent-cyan);
+}
