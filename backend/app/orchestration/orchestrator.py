@@ -144,6 +144,15 @@ class Orchestrator:
             context.status = "completed"
             memory.save_context(context)
             memory.md.write_project_md(context, team=self._team_names())
+            # Sprint status transitions (review -> completed) happen inside
+            # the review/retrospective phases, after the last save_backlog
+            # call in _phase_parallel_development -- without this, the
+            # persisted backlog.json would show a stale "active" sprint even
+            # though the project genuinely finished (PRD §25: persistent
+            # memory should reflect real project state, not a snapshot from
+            # mid-sprint).
+            memory.save_backlog(backlog)
+            memory.md.write_agile_md(backlog)
             self.run.complete()
 
             counts = _task_status_counts(backlog)

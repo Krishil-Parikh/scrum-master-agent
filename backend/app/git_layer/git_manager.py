@@ -144,8 +144,16 @@ class GitManager:
         worktree_path = self.worktrees_dir / agent_id
         if not self.remote_url:
             return GitOpResult(ok=True, log_lines=[f"No remote configured; {branch} stays local to the pod's workspace."])
-        result = self._git(worktree_path, "push", "-u", "origin", branch, timeout=120)
-        return GitOpResult(ok=result.ok, log_lines=[self._log_line(result)])
+        # Every demo project reuses the same local branch names
+        # (developer-1..6). Pushed as-is, a second project's push to a
+        # shared remote gets rejected outright (non-fast-forward: the
+        # remote branch already holds a *different* project's unrelated
+        # history). Namespace the REMOTE branch by project id so multiple
+        # projects can coexist on one GitHub repo -- local branch names
+        # (and all the sync/merge logic keyed on them) stay unchanged.
+        remote_branch = f"{self.project_id}/{branch}"
+        result = self._git(worktree_path, "push", "-u", "origin", f"{branch}:{remote_branch}", timeout=120)
+        return GitOpResult(ok=result.ok, log_lines=[self._log_line(result)], data={"remote_branch": remote_branch})
 
     # ---- sync / merge / conflicts ----
 
