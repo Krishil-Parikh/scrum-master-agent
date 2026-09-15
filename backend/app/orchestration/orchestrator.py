@@ -21,6 +21,7 @@ import sys
 from pathlib import Path
 
 from app.agents.base import BaseAgent
+from app.agents.profiles import DEVELOPER_SPECIALTIES, PROFILES
 from app.agents.registry import get_agent_registry
 from app.communication.event_bus import get_event_bus
 from app.config import get_settings
@@ -30,7 +31,7 @@ from app.llm.prompts import truncate
 from app.memory.project_memory import get_project_memory, set_current_project_id
 from app.orchestration.run_control import RunStopped, get_run_controller
 from app.orchestration.sme import run_sme_session
-from app.schemas.agent import AgentState
+from app.schemas.agent import AgentSpecialty, AgentState
 from app.schemas.communication import MessageChannel, SMEQuestion
 from app.schemas.event import EventType
 from app.schemas.project import Decision, ProjectContext
@@ -52,7 +53,11 @@ REVIEW_BUDDIES = {
     "database": "devops",
 }
 
-MAX_DEVELOPMENT_WAVES = 5
+# Safety cap on how many sprints run_full_pipeline will loop through trying
+# to fully drain the backlog before declaring the project done anyway (with
+# whatever's left logged as an explicit descope decision) -- see
+# run_full_pipeline. Prevents an unresolved BLOCKED task from looping forever.
+MAX_SPRINTS = 4
 
 
 class Orchestrator:
@@ -91,30 +96,74 @@ class Orchestrator:
             analyses = await self._phase_independent_analysis(context, memory)
             qa_results = await self._phase_sme_session(context, memory, analyses)
             backlog = await self._phase_agile_planning(context, memory, qa_results)
-            sprint = await self._phase_task_allocation_and_sprint(context, memory, backlog)
-            await self._phase_parallel_development(context, memory, backlog, git)
-            await self._phase_conflict_drill(context, memory, backlog, git)
-            await self._phase_testing_pass(context, memory, backlog, git)
-            standup_summary = await self._phase_standup(context, memory, backlog, sprint)
-            review_summary = await self._phase_sprint_review(context, memory, backlog, sprint)
-            retro = await self._phase_retrospective(context, memory, backlog, sprint, review_summary)
+
+            # ---- Sprint loop: keep going until the backlog is actually
+            # fully done, not just after one pass (Roadmap Phase 17/20 +
+            # PRD §28 feedback loop -- "the system therefore continuously
+            # evolves rather than treating the initial plan as immutable").
+            # A well-formed sprint 1 usually drains everything in one pass;
+            # further sprints exist specifically to retry whatever got
+            # BLOCKED (a syntax error that survived one fix, a rejected
+            # review) rather than declaring victory with broken work.
+            sprint = None
+            standup_summary = review_summary = ""
+            retro: dict = {}
+            sprint_number = 0
+            while True:
+                sprint_number += 1
+                sprint = await self._phase_task_allocation_and_sprint(context, memory, backlog, sprint_number=sprint_number)
+                await self._phase_parallel_development(context, memory, backlog, git)
+                if sprint_number == 1:
+                    await self._phase_conflict_drill(context, memory, backlog, git)
+                await self._phase_testing_pass(context, memory, backlog, git)
+                standup_summary = await self._phase_standup(context, memory, backlog, sprint)
+                review_summary = await self._phase_sprint_review(context, memory, backlog, sprint)
+                retro = await self._phase_retrospective(context, memory, backlog, sprint, review_summary)
+
+                unfinished = [t for t in backlog.tasks.values() if t.status != TaskStatus.COMPLETED]
+                if not unfinished:
+                    break
+                if sprint_number >= MAX_SPRINTS:
+                    context.decisions.append(Decision(
+                        context="End of sprint budget",
+                        decision=f"Stopping after {sprint_number} sprints with {len(unfinished)} task(s) left incomplete.",
+                        reason="Sprint cap reached -- remaining scope is carried over rather than looping indefinitely.",
+                        impact="; ".join(t.title for t in unfinished[:10]),
+                    ))
+                    memory.md.append_decision(context.decisions[-1])
+                    break
+                for t in unfinished:
+                    if t.status == TaskStatus.BLOCKED:
+                        t.status = TaskStatus.BACKLOG  # give it another shot next sprint
+                        t.touch()
+                await self.registry.scrum_master.say(
+                    MessageChannel.SCRUM,
+                    f"{len(unfinished)} task(s) still open — rolling into Sprint {sprint_number + 1}.",
+                )
 
             context.status = "completed"
             memory.save_context(context)
             memory.md.write_project_md(context, team=self._team_names())
             self.run.complete()
 
+            counts = _task_status_counts(backlog)
             report = {
                 "project_id": context.project_id,
                 "sprint_id": sprint.sprint_id,
+                "sprints_run": sprint_number,
                 "standup_summary": standup_summary,
                 "review_summary": review_summary,
                 "retrospective": retro,
-                "task_counts": _task_status_counts(backlog),
+                "task_counts": counts,
                 "branches": git.list_branches(),
                 "recent_commits": git.recent_commits(limit=15),
             }
             await self.bus.emit(EventType.PHASE_COMPLETED, phase="full_pipeline", **_json_safe(report))
+            await self.registry.scrum_master.say(
+                MessageChannel.SCRUM,
+                f"**Project complete** — {sprint_number} sprint(s), "
+                f"{counts.get('completed', 0)}/{len(backlog.tasks)} tasks done.",
+            )
             return report
         except RunStopped:
             logger.info("Pipeline run stopped by request at phase %s", self.run.current_phase)
@@ -134,10 +183,12 @@ class Orchestrator:
         result = git.init_repo(readme)
         for line in result.log_lines:
             await self.bus.emit(EventType.RUN_LOG, actor_id="system", text=line, channel="git")
-        for agent in self.registry.developers():
-            _, wt_result = git.ensure_agent_worktree(agent.agent_id, agent.identity.branch)
-            for line in wt_result.log_lines:
-                await self.bus.emit(EventType.RUN_LOG, actor_id=agent.agent_id, text=line, channel="git")
+        # Deliberately no per-agent worktree/branch creation here: a
+        # specialty only gets a branch (and only gets pushed to GitHub) once
+        # it actually claims a task via request_work -- see
+        # _phase_parallel_development. Not every project needs all six
+        # specialties, and an agent with nothing to do shouldn't get a
+        # branch pushed on its behalf just to look busy.
         await self.bus.emit(EventType.PHASE_COMPLETED, phase="repo_setup")
 
     # ---- Phase 5: independent analysis + discussion ------------------------
@@ -217,25 +268,43 @@ class Orchestrator:
             if lines:
                 sme_context = "\n\nSME clarifications:\n" + "\n".join(lines)
 
-        await self.registry.scrum_master.set_state(AgentState.PLANNING)
-        backlog = await self.registry.scrum_master.generate_backlog(context, sme_context=sme_context)
+        sm = self.registry.scrum_master
+        await sm.set_state(AgentState.PLANNING)
+        backlog = await sm.generate_backlog(context, sme_context=sme_context)
         memory.save_backlog(backlog)
         memory.md.write_agile_md(backlog)
-        await self.registry.scrum_master.say(
+        await sm.say(
             MessageChannel.SCRUM,
             f"Backlog is ready: {len(backlog.epics)} epics, {len(backlog.stories)} stories, "
             f"{len(backlog.tasks)} tasks.",
         )
+
+        # Decide up front which roles are actually critical for this project
+        # (the user's ask: not every project needs all six specialties) --
+        # computed from what the backlog actually contains, not assumed.
+        needed = sm.needed_specialties(backlog)
+        not_needed = [s for s in DEVELOPER_SPECIALTIES if s.value not in needed]
+        if needed:
+            needed_names = ", ".join(PROFILES[AgentSpecialty(s)].display_name for s in sorted(needed))
+            await sm.say(MessageChannel.SCRUM, f"This project needs: {needed_names}.")
+        if not_needed:
+            idle_names = ", ".join(PROFILES[s].display_name for s in not_needed)
+            await sm.say(
+                MessageChannel.SCRUM,
+                f"No dedicated work for {idle_names} on this project — "
+                f"they'll ask for work and pick up whatever's busiest instead of sitting idle or getting filler tasks.",
+            )
+
         await self.bus.emit(EventType.PHASE_COMPLETED, phase="agile_planning", tasks=len(backlog.tasks))
         return backlog
 
     # ---- Phase 8: task allocation + sprint --------------------------------
 
-    async def _phase_task_allocation_and_sprint(self, context: ProjectContext, memory, backlog: Backlog):
+    async def _phase_task_allocation_and_sprint(self, context: ProjectContext, memory, backlog: Backlog, *, sprint_number: int = 1):
         await self.run.checkpoint("task_allocation")
         sm = self.registry.scrum_master
         sm.allocate_tasks(backlog)
-        sprint = sm.create_sprint(backlog, name="Sprint 1", days=14)
+        sprint = sm.create_sprint(backlog, name=f"Sprint {sprint_number}", days=14)
         context.current_sprint_id = sprint.sprint_id
         context.status = "in_progress"
         memory.save_backlog(backlog)
@@ -244,44 +313,80 @@ class Orchestrator:
         await self.bus.emit(EventType.SPRINT_STARTED, actor_id="scrum_master", sprint_id=sprint.sprint_id, task_count=len(sprint.task_ids))
         await sm.say(
             MessageChannel.SCRUM,
-            f"Sprint 1 planned — goal: {sprint.goal} "
-            f"({len(sprint.task_ids)} tasks across the team). Let's get started!",
+            f"{sprint.name} planned — goal: {sprint.goal} "
+            f"({len(sprint.task_ids)} tasks ready so far). Let's get started!",
         )
         return sprint
 
     # ---- Phase 9-14: parallel development -----------------------------
 
     async def _phase_parallel_development(self, context: ProjectContext, memory, backlog: Backlog, git) -> None:
+        """Pull-based (PRD §6.4 / Roadmap Phase 8, 19-Test-5): each developer
+        runs its own loop asking the Scrum Master for work rather than being
+        handed a pre-sorted queue. An agent whose own specialty has nothing
+        left (or never had anything, on a project that simply doesn't need
+        that role) pivots to helping wherever the READY queue is biggest,
+        after loading that skill -- see ScrumMasterAgent.request_work."""
         sm = self.registry.scrum_master
-        for wave in range(1, MAX_DEVELOPMENT_WAVES + 1):
-            await self.run.checkpoint(f"development_wave_{wave}")
-            sm.allocate_tasks(backlog)
-            ready = [t for t in backlog.tasks.values() if t.status == TaskStatus.READY]
-            if not ready:
-                break
+        developers = self.registry.developers()
+        lock = asyncio.Lock()
+        helping_announced: set[str] = set()
 
-            by_agent: dict[str, list[Task]] = {}
-            for t in ready:
-                by_agent.setdefault(t.assigned_agent_id, []).append(t)
+        await self.bus.emit(EventType.PHASE_STARTED, phase="parallel_development", agents=[a.agent_id for a in developers])
 
-            await self.bus.emit(EventType.PHASE_STARTED, phase=f"development_wave_{wave}", agents=list(by_agent.keys()))
-            await asyncio.gather(
-                *(self._run_agent_task_queue(context, memory, backlog, git, agent_id, tasks) for agent_id, tasks in by_agent.items())
-            )
-            memory.save_backlog(backlog)
-            memory.md.write_agile_md(backlog)
-            await self.bus.emit(EventType.PHASE_COMPLETED, phase=f"development_wave_{wave}")
+        async def worker(agent: BaseAgent) -> None:
+            idle_polls = 0
+            while True:
+                await self.run.checkpoint("parallel_development")
+                async with lock:
+                    sm.allocate_tasks(backlog)
+                    task = sm.request_work(backlog, agent)
+                    if task is not None:
+                        task.status = TaskStatus.IN_PROGRESS
+                        task.touch()
 
+                if task is None:
+                    unfinished = any(
+                        t.status in (TaskStatus.BACKLOG, TaskStatus.READY, TaskStatus.IN_PROGRESS)
+                        for t in backlog.tasks.values()
+                    )
+                    if not unfinished:
+                        break
+                    idle_polls += 1
+                    if idle_polls > 200:  # ~10s of genuinely nothing claimable anywhere -- stop spinning
+                        break
+                    await asyncio.sleep(0.05)
+                    continue
+
+                idle_polls = 0
+                is_helping = task.specialty.value != agent.profile.specialty.value
+                if is_helping:
+                    if task.specialty.value not in helping_announced:
+                        helping_announced.add(task.specialty.value)
+                        await agent.say(
+                            MessageChannel.SCRUM,
+                            f"No {PROFILES[task.specialty].display_name} work of my own on this project — "
+                            f"asking to help with {PROFILES[task.specialty].display_name} tasks instead.",
+                        )
+                    await agent.load_skill(task.specialty.value, reason=f"picking up '{task.title}' (no {agent.profile.specialty.value} work left in this project)")
+
+                await self._implement_one_task(context, memory, backlog, git, agent, task)
+
+        await asyncio.gather(*(worker(a) for a in developers))
         sm.allocate_tasks(backlog)
         memory.save_backlog(backlog)
         memory.md.write_agile_md(backlog)
-
-    async def _run_agent_task_queue(self, context, memory, backlog: Backlog, git, agent_id: str, tasks: list[Task]) -> None:
-        agent = self.registry.get(agent_id)
-        for task in tasks:
-            await self._implement_one_task(context, memory, backlog, git, agent, task)
+        await self.bus.emit(EventType.PHASE_COMPLETED, phase="parallel_development")
 
     async def _implement_one_task(self, context, memory, backlog: Backlog, git, agent: BaseAgent, task: Task) -> None:
+        # The task's OWNING specialty decides which branch/worktree the work
+        # lands on -- not which agent actually did it. This is what lets a
+        # helper (e.g. Frontend picking up a Backend task because there's no
+        # Frontend work left) commit to the Backend branch rather than
+        # creating a stray branch of their own.
+        owner_specialty = task.specialty.value
+        owner_branch = task.branch or PROFILES[task.specialty].branch
+
         task.status = TaskStatus.IN_PROGRESS
         task.touch()
         await self.bus.emit(EventType.TASK_ASSIGNED, actor_id=agent.agent_id, task_id=task.task_id, title=task.title)
@@ -294,24 +399,33 @@ class Orchestrator:
             dep_task = backlog.tasks.get(dep_id)
             if not dep_task or dep_task.status != TaskStatus.COMPLETED or not dep_task.branch:
                 continue
-            if dep_task.branch == agent.identity.branch:
+            if dep_task.branch == owner_branch:
                 continue
-            sync_result = git.sync_branch(agent.agent_id, dep_task.branch)
+            sync_result = git.sync_branch(owner_specialty, dep_task.branch)
             for line in sync_result.log_lines:
                 await self.bus.emit(EventType.RUN_LOG, actor_id=agent.agent_id, text=line, channel="git")
             if not sync_result.ok and sync_result.data.get("status") == "conflict":
-                await self._resolve_sync_conflict(context, git, agent, dep_task, sync_result.data.get("conflicted_files", []))
+                await self._resolve_sync_conflict(context, git, agent, owner_specialty, dep_task, sync_result.data.get("conflicted_files", []))
             if dep_task.files_changed:
                 snippets = []
                 for path in dep_task.files_changed[:2]:
-                    content = git.show_file_at_ref(agent.agent_id, "HEAD", path)
+                    content = git.show_file_at_ref(owner_specialty, "HEAD", path)
                     if content:
                         snippets.append(f"{path}:\n{truncate(content, 1200)}")
                 if snippets:
                     dep_context += f"\n\nRelevant files from dependency '{dep_task.title}':\n" + "\n\n".join(snippets)
 
-        # --- implement ---
-        skill_body = agent.primary_skill_body()
+        if task.blocked_reason:
+            dep_context += f"\n\nThis task was previously blocked and is being retried: {task.blocked_reason}\nMake sure your implementation actually resolves that."
+
+        # --- implement (use the TASK's specialty skill when helping, not
+        # the acting agent's own -- e.g. Frontend covering a Backend task
+        # should be guided by Backend's skill body) ---
+        if owner_specialty != agent.profile.specialty.value:
+            helper_skill = agent.skills.get(owner_specialty)
+            skill_body = helper_skill.body if helper_skill else ""
+        else:
+            skill_body = agent.primary_skill_body()
         result = await agent.implement_task(context, task, extra_context=dep_context, skill_body=skill_body)
         if result.get("error") or not result.get("files"):
             task.status = TaskStatus.BLOCKED
@@ -321,7 +435,7 @@ class Orchestrator:
             return
 
         commit_msg = f"{task.title}\n\n{result.get('summary', '')}".strip()
-        commit_result = git.write_and_commit(agent.agent_id, agent.identity.branch, result["files"], commit_msg)
+        commit_result = git.write_and_commit(owner_specialty, owner_branch, result["files"], commit_msg)
         for line in commit_result.log_lines:
             await self.bus.emit(EventType.RUN_LOG, actor_id=agent.agent_id, text=line, channel="git")
 
@@ -329,7 +443,7 @@ class Orchestrator:
             task.files_changed = list(result["files"].keys())
             memory.md.append_git_activity(
                 agent=agent.identity.display_name,
-                branch=agent.identity.branch or "",
+                branch=owner_branch or "",
                 commit=commit_result.data["sha"],
                 purpose=task.title,
                 files_changed=task.files_changed,
@@ -339,23 +453,73 @@ class Orchestrator:
                 actor_id=agent.agent_id,
                 task_id=task.task_id,
                 sha=commit_result.data["sha"],
-                branch=agent.identity.branch,
+                branch=owner_branch,
             )
-            push_result = git.push(agent.agent_id, agent.identity.branch or "")
+            push_result = git.push(owner_specialty, owner_branch or "")
             for line in push_result.log_lines:
                 await self.bus.emit(EventType.RUN_LOG, actor_id=agent.agent_id, text=line, channel="git")
+            helping_note = f" (helping {PROFILES[task.specialty].display_name})" if owner_specialty != agent.profile.specialty.value else ""
             await agent.say(
                 MessageChannel.GIT,
-                f"Pushed `{commit_result.data['sha']}` to `{agent.identity.branch}`: {result.get('summary', task.title)}",
+                f"Pushed `{commit_result.data['sha']}` to `{owner_branch}`{helping_note}: {result.get('summary', task.title)}",
             )
 
-        # --- self-review, then buddy cross-specialty review ---
+        # --- Phase 14 quality gate: syntax-validate what was just written.
+        # A caught error gets exactly one fix attempt from the responsible
+        # agent before the task is honestly marked BLOCKED -- logging the
+        # failure without acting on it (as before) isn't a real quality
+        # gate (Roadmap Phase 14 success gate: a detected bug must be fixed
+        # before the task counts as complete).
+        py_files = [p for p in result["files"] if p.endswith(".py")]
+        if py_files and commit_result.ok:
+            worktree = git.worktrees_dir / owner_specialty
+            compile_errors = []
+            for rel in py_files:
+                chk = run_command(worktree, [sys.executable, "-m", "py_compile", rel], timeout=20)
+                if not chk.ok:
+                    compile_errors.append(f"{rel}:\n{chk.combined_output.strip()}")
+            if compile_errors:
+                error_text = "\n\n".join(compile_errors)
+                await self.bus.emit(
+                    EventType.RUN_LOG, actor_id=agent.agent_id, channel="test",
+                    text=f"$ python -m py_compile ({len(compile_errors)} file(s) failed)\n{error_text}",
+                )
+                await agent.say(MessageChannel.TASKS, f"Caught a syntax error in my own change to **{task.title}** — fixing it before calling this done.")
+                fix = await agent.implement_task(
+                    context, task, skill_body=skill_body,
+                    extra_context=f"Your previous submission for this task has a syntax error and must be fixed:\n{error_text}\n\nResubmit corrected versions of ALL files for this task.",
+                )
+                still_broken = list(compile_errors)
+                if fix.get("files"):
+                    fix_commit = git.write_and_commit(owner_specialty, owner_branch, fix["files"], f"Fix syntax error in {task.title}")
+                    for line in fix_commit.log_lines:
+                        await self.bus.emit(EventType.RUN_LOG, actor_id=agent.agent_id, text=line, channel="git")
+                    if fix_commit.ok and fix_commit.data.get("sha"):
+                        git.push(owner_specialty, owner_branch or "")
+                        result["files"] = {**result["files"], **fix["files"]}
+                        task.files_changed = list(result["files"].keys())
+                        still_broken = []
+                        for rel in [p for p in fix["files"] if p.endswith(".py")]:
+                            chk = run_command(worktree, [sys.executable, "-m", "py_compile", rel], timeout=20)
+                            if not chk.ok:
+                                still_broken.append(f"{rel}:\n{chk.combined_output.strip()}")
+                if still_broken:
+                    task.status = TaskStatus.BLOCKED
+                    task.blocked_reason = f"Syntax error persisted after one fix attempt: {still_broken[0][:300]}"
+                    task.touch()
+                    await self.bus.emit(EventType.TASK_BLOCKED, actor_id=agent.agent_id, task_id=task.task_id, reason=task.blocked_reason)
+                    return
+                await agent.say(MessageChannel.TASKS, f"Fixed it — **{task.title}** compiles cleanly now.")
+
+        # --- self-review, then buddy cross-specialty review (buddy is
+        # picked by the task's owning specialty, not the acting agent, so
+        # code always gets reviewed by that specialty's real counterpart) ---
         self_review = await agent.review_files(context, task, result["files"])
-        buddy_id = REVIEW_BUDDIES.get(agent.agent_id)
+        buddy_id = REVIEW_BUDDIES.get(owner_specialty)
         buddy = self.registry.get(buddy_id) if buddy_id else None
         buddy_review = {"approved": True, "findings": []}
         if buddy is not None:
-            await buddy.load_skill(agent.profile.specialty.value, reason=f"reviewing {agent.identity.display_name}'s change")
+            await buddy.load_skill(owner_specialty, reason=f"reviewing {agent.identity.display_name}'s change")
             await self.bus.emit(EventType.REVIEW_REQUESTED, actor_id=agent.agent_id, reviewer=buddy.agent_id, task_id=task.task_id)
             buddy_review = await buddy.review_files(context, task, result["files"])
             findings = buddy_review.get("findings", []) or []
@@ -376,11 +540,12 @@ class Orchestrator:
             return
 
         task.status = TaskStatus.COMPLETED
+        task.blocked_reason = None
         task.touch()
         await agent.set_state(AgentState.COMPLETED, note=task.title)
         await self.bus.emit(EventType.TASK_COMPLETED, actor_id=agent.agent_id, task_id=task.task_id, title=task.title)
 
-    async def _resolve_sync_conflict(self, context, git, agent: BaseAgent, dep_task: Task, conflicted_files: list[str]) -> None:
+    async def _resolve_sync_conflict(self, context, git, agent: BaseAgent, owner_specialty: str, dep_task: Task, conflicted_files: list[str]) -> None:
         await self.bus.emit(
             EventType.MERGE_CONFLICT, actor_id=agent.agent_id, files=conflicted_files, with_branch=dep_task.branch
         )
@@ -388,13 +553,13 @@ class Orchestrator:
         other_name = dep_agent.identity.display_name if dep_agent else dep_task.branch or "another agent"
         resolved: dict[str, str] = {}
         for path in conflicted_files:
-            ours = git.show_file_at_ref(agent.agent_id, "HEAD", path)
-            theirs = git.show_file_at_ref(agent.agent_id, dep_task.branch or "", path)
+            ours = git.show_file_at_ref(owner_specialty, "HEAD", path)
+            theirs = git.show_file_at_ref(owner_specialty, dep_task.branch or "", path)
             outcome = await agent.resolve_conflict(
                 context, file_path=path, my_version=ours, other_agent_name=other_name, other_version=theirs, my_task=dep_task
             )
             resolved[path] = outcome.get("resolved_content", ours)
-        commit = git.resolve_conflict(agent.agent_id, resolved, f"Merge {dep_task.branch}: resolve conflict in {', '.join(conflicted_files)}")
+        commit = git.resolve_conflict(owner_specialty, resolved, f"Merge {dep_task.branch}: resolve conflict in {', '.join(conflicted_files)}")
         for line in commit.log_lines:
             await self.bus.emit(EventType.RUN_LOG, actor_id=agent.agent_id, text=line, channel="git")
         await self.bus.emit(EventType.MERGE_RESOLVED, actor_id=agent.agent_id, files=conflicted_files)
@@ -403,6 +568,15 @@ class Orchestrator:
 
     async def _phase_conflict_drill(self, context: ProjectContext, memory, backlog: Backlog, git) -> None:
         await self.run.checkpoint("conflict_drill")
+        needed = {t.specialty.value for t in backlog.tasks.values()}
+        if "frontend" not in needed or "backend" not in needed:
+            await self.bus.emit(EventType.PHASE_STARTED, phase="conflict_drill")
+            await self.registry.scrum_master.say(
+                MessageChannel.SCRUM,
+                "Skipping the conflict drill — this project doesn't have both frontend and backend work to stage it against.",
+            )
+            await self.bus.emit(EventType.PHASE_COMPLETED, phase="conflict_drill")
+            return
         frontend = self.registry.get("frontend")
         backend = self.registry.get("backend")
         shared_task = Task(
@@ -576,6 +750,7 @@ def _json_safe(d: dict) -> dict:
     return {
         "project_id": d.get("project_id"),
         "sprint_id": d.get("sprint_id"),
+        "sprints_run": d.get("sprints_run"),
         "task_counts": d.get("task_counts"),
     }
 

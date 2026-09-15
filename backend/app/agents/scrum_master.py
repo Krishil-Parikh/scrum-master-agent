@@ -47,6 +47,8 @@ Confirmed decisions from SME clarification:
 
 Break this project into Epics -> User Stories -> Tasks. Every task MUST be assigned a "specialty" from exactly this set: frontend, backend, ai_ml, devops, mlops, database.
 
+Decide for yourself which of those six specialties this specific project actually needs -- do not invent filler work for a specialty just to keep it represented. A small CRUD app might genuinely only need frontend, backend, and database; it does not need an ai_ml or mlops task just because those roles exist on the pod. Only include devops, ai_ml, or mlops tasks when the requirements actually call for them (e.g. no AI/ML task unless the project has an AI-powered feature; no dedicated devops task unless deployment/CI is in scope beyond what backend already covers). Specialties with no real work this project needs should simply have zero tasks -- the pod will have those developers help wherever the work actually is instead.
+
 Return a JSON object:
 {{
   "epics": [
@@ -76,7 +78,7 @@ Return a JSON object:
   ]
 }}
 
-Produce 3-5 epics covering the full project (including at least one Database task, one DevOps task, and AI/ML tasks if the project has an AI component). Keep task titles short and unique across the whole backlog so dependencies can reference them unambiguously. Aim for roughly 15-25 tasks total.
+Produce 3-5 epics covering the full project, sized to what the project actually needs -- keep task titles short and unique across the whole backlog so dependencies can reference them unambiguously. Aim for roughly 10-25 tasks total depending on real scope, not a fixed count.
 """.strip()
         # This is the single largest structured-output call in the whole
         # pipeline (up to ~25 tasks nested in stories/epics) -- give it a
@@ -106,6 +108,53 @@ Produce 3-5 epics covering the full project (including at least one Database tas
                 task.status = TaskStatus.READY
                 task.touch()
         return backlog
+
+    def needed_specialties(self, backlog: Backlog) -> set[str]:
+        """Which specialties this project actually has work for -- computed
+        from the backlog the LLM produced, not assumed. Roadmap Phase 8
+        + the user's ask: decide up front which roles are critical instead
+        of forcing every specialty to be represented."""
+        return {t.specialty.value for t in backlog.tasks.values()}
+
+    def request_work(self, backlog: Backlog, requester) -> Task | None:
+        """Pull-based allocation (PRD §6.4 "developers ask their mentors
+        for work" rather than being handed it; Roadmap Phase 8 dynamic
+        reassignment / Phase 19 Test 5 cross-specialty assistance).
+
+        A developer calls this instead of being pushed a task. Their own
+        specialty's READY queue is served first. If their specialty simply
+        has no work anywhere in this backlog (or has already finished all
+        of it) they pivot to helping wherever the READY queue is currently
+        biggest, after loading that specialty's skill -- this is what makes
+        an unneeded role (e.g. MLOps on a small CRUD app) contribute instead
+        of sitting idle, without forcing filler work onto their own branch.
+        Callers are expected to serialize calls to this (e.g. one shared
+        lock) since it mutates the backlog."""
+        own = requester.profile.specialty.value
+        own_ready = [t for t in backlog.tasks.values() if t.status == TaskStatus.READY and t.specialty.value == own]
+        if own_ready:
+            task = own_ready[0]
+            task.assigned_agent_id = requester.agent_id
+            return task
+
+        own_pending = any(
+            t.specialty.value == own and t.status in (TaskStatus.BACKLOG, TaskStatus.IN_PROGRESS)
+            for t in backlog.tasks.values()
+        )
+        if own_pending:
+            return None  # own work exists but is waiting on a dependency -- don't poach, just wait
+
+        by_specialty: dict[str, list[Task]] = {}
+        for t in backlog.tasks.values():
+            if t.status == TaskStatus.READY:
+                by_specialty.setdefault(t.specialty.value, []).append(t)
+        if not by_specialty:
+            return None
+
+        busiest = max(by_specialty, key=lambda s: len(by_specialty[s]))
+        task = by_specialty[busiest][0]
+        task.assigned_agent_id = requester.agent_id
+        return task
 
     def create_sprint(self, backlog: Backlog, *, name: str = "Sprint 1", goal: str = "", days: int = 14) -> Sprint:
         ready_task_ids = [t.task_id for t in backlog.tasks.values() if t.status in (TaskStatus.READY, TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED, TaskStatus.REVIEW, TaskStatus.COMPLETED)]
