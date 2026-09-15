@@ -38,6 +38,7 @@ from app.schemas.project import Decision, ProjectContext
 from app.schemas.task import Backlog, Task, TaskStatus
 from app.tools.code_search import grep, list_tree, read_file_safe, search_symbols
 from app.tools.command_runner import run_command
+from app.tools.syntax_check import check_file
 
 logger = logging.getLogger("ai_dev_pod.orchestrator")
 
@@ -530,25 +531,23 @@ class Orchestrator:
                 f"Pushed `{commit_result.data['sha']}` to `{owner_branch}`{helping_note}: {result.get('summary', task.title)}",
             )
 
-        # --- Phase 14 quality gate: syntax-validate what was just written.
-        # A caught error gets exactly one fix attempt from the responsible
-        # agent before the task is honestly marked BLOCKED -- logging the
-        # failure without acting on it (as before) isn't a real quality
-        # gate (Roadmap Phase 14 success gate: a detected bug must be fixed
-        # before the task counts as complete).
-        py_files = [p for p in result["files"] if p.endswith(".py")]
-        if py_files and commit_result.ok:
+        # --- Phase 14 quality gate: syntax-validate what was just written,
+        # in whatever language it's actually in (scaling roadmap #5 --
+        # Python via py_compile, plain JS via Node's own --check, JSX/TSX/TS
+        # via a structural heuristic; see syntax_check.py). The old gate
+        # only ever checked .py files -- frontend output got zero
+        # validation. A caught error gets exactly one fix attempt from the
+        # responsible agent before the task is honestly marked BLOCKED --
+        # logging a failure without acting on it isn't a real quality gate.
+        checkable_files = [p for p in result["files"] if Path(p).suffix.lower() in (".py", ".js", ".jsx", ".ts", ".tsx")]
+        if checkable_files and commit_result.ok:
             worktree = git.worktrees_dir / owner_specialty
-            compile_errors = []
-            for rel in py_files:
-                chk = run_command(worktree, [sys.executable, "-m", "py_compile", rel], timeout=20)
-                if not chk.ok:
-                    compile_errors.append(f"{rel}:\n{chk.combined_output.strip()}")
+            compile_errors = [f"{rel}:\n{err}" for rel in checkable_files if (err := check_file(worktree, rel))]
             if compile_errors:
                 error_text = "\n\n".join(compile_errors)
                 await self.bus.emit(
                     EventType.RUN_LOG, actor_id=agent.agent_id, channel="test",
-                    text=f"$ python -m py_compile ({len(compile_errors)} file(s) failed)\n{error_text}",
+                    text=f"$ syntax check ({len(compile_errors)} file(s) failed)\n{error_text}",
                 )
                 await agent.say(MessageChannel.TASKS, f"Caught a syntax error in my own change to **{task.title}** — fixing it before calling this done.")
                 fix = await agent.implement_task(
@@ -564,11 +563,11 @@ class Orchestrator:
                         git.push(owner_specialty, owner_branch or "")
                         result["files"] = {**result["files"], **fix["files"]}
                         task.files_changed = list(result["files"].keys())
-                        still_broken = []
-                        for rel in [p for p in fix["files"] if p.endswith(".py")]:
-                            chk = run_command(worktree, [sys.executable, "-m", "py_compile", rel], timeout=20)
-                            if not chk.ok:
-                                still_broken.append(f"{rel}:\n{chk.combined_output.strip()}")
+                        still_broken = [
+                            f"{rel}:\n{err}"
+                            for rel in fix["files"]
+                            if Path(rel).suffix.lower() in (".py", ".js", ".jsx", ".ts", ".tsx") and (err := check_file(worktree, rel))
+                        ]
                 if still_broken:
                     task.status = TaskStatus.BLOCKED
                     task.blocked_reason = f"Syntax error persisted after one fix attempt: {still_broken[0][:300]}"
@@ -718,29 +717,82 @@ class Orchestrator:
     # ---- Phase 14: testing pass ------------------------------------------
 
     async def _phase_testing_pass(self, context: ProjectContext, memory, backlog: Backlog, git) -> None:
+        """Scaling roadmap #5: a whole-worktree, multi-language sweep, not
+        just the first 10 .py files. This is the net that catches a
+        cross-file regression one task's per-task gate can't see (that gate
+        only checks the files THAT task touched)."""
         await self.run.checkpoint("testing")
         await self.bus.emit(EventType.PHASE_STARTED, phase="testing")
+        ignored_dirs = {"node_modules", "__pycache__", ".git", ".venv", "venv", "dist", "build"}
         for agent in self.registry.developers():
             worktree = git.worktrees_dir / agent.agent_id
             if not worktree.exists():
                 continue
-            py_files = list(worktree.rglob("*.py"))
-            if not py_files:
-                continue
-            for f in py_files[:10]:
-                result = run_command(worktree, [sys.executable, "-m", "py_compile", str(f)], timeout=20)
-                await self.bus.emit(
-                    EventType.RUN_LOG, actor_id=agent.agent_id, channel="test",
-                    text=f"$ python -m py_compile {f.relative_to(worktree)}\n{result.combined_output or '(no output -- syntax OK)'}",
-                )
+
+            checkable = [
+                f for f in worktree.rglob("*")
+                if f.is_file()
+                and f.suffix.lower() in (".py", ".js", ".jsx", ".ts", ".tsx")
+                and not any(part in ignored_dirs for part in f.relative_to(worktree).parts)
+            ]
+            failures = []
+            for f in checkable[:60]:
+                rel = str(f.relative_to(worktree)).replace("\\", "/")
+                err = check_file(worktree, rel)
+                if err:
+                    failures.append(f"{rel}: {err}")
+            await self.bus.emit(
+                EventType.RUN_LOG, actor_id=agent.agent_id, channel="test",
+                text=f"$ syntax sweep ({len(checkable)} file(s))\n" + ("\n".join(failures) if failures else "(no output -- syntax OK)"),
+            )
+
             test_files = list(worktree.rglob("test_*.py")) + list(worktree.rglob("*_test.py"))
-            if test_files:
-                result = run_command(worktree, [sys.executable, "-m", "pytest", "-q"], timeout=45)
-                await self.bus.emit(
-                    EventType.RUN_LOG, actor_id=agent.agent_id, channel="test",
-                    text=f"$ python -m pytest -q\n{result.combined_output}",
-                )
+            if not test_files:
+                continue
+
+            # Real execution, not just syntax, when explicitly enabled (see
+            # settings.enable_dependency_install_for_tests docstring):
+            # install that worktree's requirements.txt into an isolated
+            # per-project venv (never the backend's own environment) and
+            # run pytest with it, so tests can actually execute instead of
+            # erroring on every missing import.
+            python_for_tests = sys.executable
+            isolated = False
+            if self.settings.enable_dependency_install_for_tests:
+                venv_python = await self._ensure_project_test_venv(git.project_dir, worktree)
+                if venv_python:
+                    python_for_tests, isolated = str(venv_python), True
+
+            result = run_command(worktree, [python_for_tests, "-m", "pytest", "-q"], timeout=90)
+            await self.bus.emit(
+                EventType.RUN_LOG, actor_id=agent.agent_id, channel="test",
+                text=f"$ pytest -q{' (isolated venv, deps installed)' if isolated else ' (no deps installed -- import errors expected unless stdlib-only)'}\n{result.combined_output}",
+            )
         await self.bus.emit(EventType.PHASE_COMPLETED, phase="testing")
+
+    async def _ensure_project_test_venv(self, project_dir: Path, worktree: Path) -> Path | None:
+        """Create once per project (reused across every worktree/sprint)
+        and pip-install that worktree's requirements.txt into it. Returns
+        None (falls back to syntax-only) on any failure -- a broken
+        dependency install should degrade the testing phase, not crash the
+        pipeline."""
+        req_file = worktree / "requirements.txt"
+        if not req_file.exists():
+            return None
+        venv_dir = project_dir / ".test_venv"
+        venv_python = venv_dir / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+        if not venv_python.exists():
+            created = run_command(project_dir, [sys.executable, "-m", "venv", str(venv_dir)], timeout=60)
+            if not created.ok:
+                logger.warning("Could not create isolated test venv at %s: %s", venv_dir, created.combined_output[:300])
+                return None
+        installed = run_command(
+            worktree, [str(venv_python), "-m", "pip", "install", "-q", "-r", "requirements.txt"], timeout=120,
+        )
+        if not installed.ok:
+            logger.warning("Dependency install failed for %s: %s", worktree, installed.combined_output[:500])
+            return None
+        return venv_python
 
     # ---- Phase 15: stand-up -----------------------------------------------
 

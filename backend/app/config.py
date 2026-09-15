@@ -72,6 +72,19 @@ class Settings(BaseSettings):
     # --- SME ---
     sme_mode: str = "auto"  # "auto" | "human"
 
+    # --- Testing (scaling roadmap #5) ---
+    # Off by default: enabling this makes the testing phase `pip install`
+    # whatever the LLM-generated requirements.txt says, into a per-project
+    # venv, before running pytest -- which lets tests actually EXECUTE
+    # (catching real logic/integration bugs) instead of only ever being
+    # syntax-checked. That's a real capability upgrade, but it also means
+    # automatically running `pip install` against arbitrary
+    # model-generated package names with no human review first -- a
+    # supply-chain risk the PRD's own security requirements (§34: "Restrict
+    # destructive commands") argue against doing silently. Turn on
+    # deliberately, not as a side effect of upgrading.
+    enable_dependency_install_for_tests: bool = False
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
