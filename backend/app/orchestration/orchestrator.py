@@ -61,6 +61,16 @@ REVIEW_BUDDIES = {
 # run_full_pipeline. Prevents an unresolved BLOCKED task from looping forever.
 MAX_SPRINTS = 4
 
+# Horizontal scaling (roadmap #4): a specialty carrying more than this many
+# not-yet-completed tasks gets another bounded agent instance instead of
+# one agent churning through all of them serially -- "more agents, not
+# more context per agent" is the concrete finding scaling research on
+# multi-agent code generation converges on. MAX_EXTRA_INSTANCES_PER_SPECIALTY
+# keeps this bounded so a very large backlog doesn't spawn an unbounded
+# number of agents (and LLM calls) at once.
+TASKS_PER_EXTRA_AGENT = 8
+MAX_EXTRA_INSTANCES_PER_SPECIALTY = 2
+
 
 class Orchestrator:
     def __init__(self) -> None:
@@ -355,6 +365,7 @@ class Orchestrator:
         that role) pivots to helping wherever the READY queue is biggest,
         after loading that skill -- see ScrumMasterAgent.request_work."""
         sm = self.registry.scrum_master
+        await self._scale_team_to_backlog(backlog)
         developers = self.registry.developers()
         lock = asyncio.Lock()
         helping_announced: set[str] = set()
@@ -405,14 +416,54 @@ class Orchestrator:
         memory.md.write_agile_md(backlog)
         await self.bus.emit(EventType.PHASE_COMPLETED, phase="parallel_development")
 
+    async def _scale_team_to_backlog(self, backlog: Backlog) -> None:
+        """Spin up extra bounded agent instances for any specialty carrying
+        more not-yet-done work than one agent can reasonably churn through
+        serially (scaling roadmap #4). Idempotent and safe to call at the
+        start of every sprint -- spawn_extra_instance is a no-op for a
+        (specialty, index) pair that already exists, and the count only
+        ever looks at *current* unfinished work, so this naturally scales
+        down on its own as a specialty's backlog drains (no extra instance
+        gets spawned once there's nothing left to justify one)."""
+        pending_by_specialty: dict[AgentSpecialty, int] = {}
+        for t in backlog.tasks.values():
+            if t.status in (TaskStatus.BACKLOG, TaskStatus.READY, TaskStatus.IN_PROGRESS):
+                pending_by_specialty[t.specialty] = pending_by_specialty.get(t.specialty, 0) + 1
+
+        for specialty, count in pending_by_specialty.items():
+            extra_needed = min(count // TASKS_PER_EXTRA_AGENT, MAX_EXTRA_INSTANCES_PER_SPECIALTY)
+            existing = len(self.registry.extra_instances_for(specialty))
+            for index in range(existing + 2, extra_needed + 2):  # primary has no suffix; extras start at #2
+                extra = self.registry.spawn_extra_instance(specialty, index)
+                await self.bus.emit(EventType.RUN_LOG, actor_id="system", channel="scaling", text=f"Spawned {extra.identity.display_name} (branch {extra.identity.branch}) -- {count} {specialty.value} tasks pending, more than one agent should churn through serially.")
+                await self.registry.scrum_master.say(
+                    MessageChannel.SCRUM,
+                    f"{count} {PROFILES[specialty].display_name} tasks pending -- bringing on {extra.identity.display_name} to help work through them in parallel.",
+                )
+
     async def _implement_one_task(self, context, memory, backlog: Backlog, git, agent: BaseAgent, task: Task) -> None:
-        # The task's OWNING specialty decides which branch/worktree the work
-        # lands on -- not which agent actually did it. This is what lets a
-        # helper (e.g. Frontend picking up a Backend task because there's no
-        # Frontend work left) commit to the Backend branch rather than
-        # creating a stray branch of their own.
-        owner_specialty = task.specialty.value
-        owner_branch = task.branch or PROFILES[task.specialty].branch
+        # Two separate notions of "ownership" here, deliberately kept apart
+        # (scaling roadmap #4 made this necessary -- with only one agent
+        # per specialty the two used to always coincide):
+        #
+        # task_specialty: SEMANTIC ownership -- which skill body to use,
+        #   which buddy reviews it, which specialty tag the codemap records
+        #   it under. Always the task's actual specialty, no matter who
+        #   implements it.
+        #
+        # git_key / git_branch: which worktree/branch this commit actually
+        #   lands on. For the specialty's primary agent (or a genuine
+        #   cross-specialty helper picking up overflow work) that's the
+        #   specialty's one canonical branch -- same as before. For an
+        #   EXTRA instance of the SAME specialty (e.g. "backend-2"), it's
+        #   that instance's own branch, so two siblings committing at the
+        #   same time never race on one shared worktree; see
+        #   _consolidate_into_primary for how that work gets folded back.
+        task_specialty = task.specialty.value
+        same_specialty = agent.profile.specialty.value == task_specialty
+        is_extra_instance = same_specialty and agent.agent_id != task_specialty
+        git_key = agent.agent_id if same_specialty else task_specialty
+        git_branch = agent.identity.branch if same_specialty else (task.branch or PROFILES[task.specialty].branch)
 
         task.status = TaskStatus.IN_PROGRESS
         task.touch()
@@ -426,17 +477,17 @@ class Orchestrator:
             dep_task = backlog.tasks.get(dep_id)
             if not dep_task or dep_task.status != TaskStatus.COMPLETED or not dep_task.branch:
                 continue
-            if dep_task.branch == owner_branch:
+            if dep_task.branch == git_branch:
                 continue
-            sync_result = git.sync_branch(owner_specialty, dep_task.branch)
+            sync_result = git.sync_branch(git_key, dep_task.branch)
             for line in sync_result.log_lines:
                 await self.bus.emit(EventType.RUN_LOG, actor_id=agent.agent_id, text=line, channel="git")
             if not sync_result.ok and sync_result.data.get("status") == "conflict":
-                await self._resolve_sync_conflict(context, git, agent, owner_specialty, dep_task, sync_result.data.get("conflicted_files", []))
+                await self._resolve_sync_conflict(context, git, agent, git_key, dep_task, sync_result.data.get("conflicted_files", []))
             if dep_task.files_changed:
                 snippets = []
                 for path in dep_task.files_changed[:2]:
-                    content = git.show_file_at_ref(owner_specialty, "HEAD", path)
+                    content = git.show_file_at_ref(git_key, "HEAD", path)
                     if content:
                         snippets.append(f"{path}:\n{truncate(content, 1200)}")
                 if snippets:
@@ -449,7 +500,7 @@ class Orchestrator:
         # (scaling roadmap #1): ask what it needs, resolve those requests
         # against the actual worktree, and hand back real answers instead
         # of the orchestrator guessing which 1-2 files to truncate. ---
-        owner_worktree = git.worktrees_dir / owner_specialty
+        owner_worktree = git.worktrees_dir / git_key
         tree = list_tree(owner_worktree) if owner_worktree.exists() else []
         if tree:
             requests = await agent.plan_context_requests(context, task, tree=tree)
@@ -480,7 +531,7 @@ class Orchestrator:
         # (specialty + keyword match, no LLM call) against the codemap
         # every completed task updates itself into. ---
         codemap_keywords = [task.title, *task.description.split()]
-        codemap_hits = memory.codemap.relevant_to(specialty=owner_specialty, keywords=codemap_keywords, max_entries=6)
+        codemap_hits = memory.codemap.relevant_to(specialty=task_specialty, keywords=codemap_keywords, max_entries=6)
         codemap_text = memory.codemap.render(codemap_hits)
         if codemap_text:
             dep_context += "\n\nRelevant existing code elsewhere in this project (from the project codemap):\n" + codemap_text
@@ -488,8 +539,8 @@ class Orchestrator:
         # --- implement (use the TASK's specialty skill when helping, not
         # the acting agent's own -- e.g. Frontend covering a Backend task
         # should be guided by Backend's skill body) ---
-        if owner_specialty != agent.profile.specialty.value:
-            helper_skill = agent.skills.get(owner_specialty)
+        if not same_specialty:
+            helper_skill = agent.skills.get(task_specialty)
             skill_body = helper_skill.body if helper_skill else ""
         else:
             skill_body = agent.primary_skill_body()
@@ -502,7 +553,7 @@ class Orchestrator:
             return
 
         commit_msg = f"{task.title}\n\n{result.get('summary', '')}".strip()
-        commit_result = git.write_and_commit(owner_specialty, owner_branch, result["files"], commit_msg)
+        commit_result = git.write_and_commit(git_key, git_branch, result["files"], commit_msg)
         for line in commit_result.log_lines:
             await self.bus.emit(EventType.RUN_LOG, actor_id=agent.agent_id, text=line, channel="git")
 
@@ -510,7 +561,7 @@ class Orchestrator:
             task.files_changed = list(result["files"].keys())
             memory.md.append_git_activity(
                 agent=agent.identity.display_name,
-                branch=owner_branch or "",
+                branch=git_branch or "",
                 commit=commit_result.data["sha"],
                 purpose=task.title,
                 files_changed=task.files_changed,
@@ -520,15 +571,15 @@ class Orchestrator:
                 actor_id=agent.agent_id,
                 task_id=task.task_id,
                 sha=commit_result.data["sha"],
-                branch=owner_branch,
+                branch=git_branch,
             )
-            push_result = git.push(owner_specialty, owner_branch or "")
+            push_result = git.push(git_key, git_branch or "")
             for line in push_result.log_lines:
                 await self.bus.emit(EventType.RUN_LOG, actor_id=agent.agent_id, text=line, channel="git")
-            helping_note = f" (helping {PROFILES[task.specialty].display_name})" if owner_specialty != agent.profile.specialty.value else ""
+            helping_note = f" (helping {PROFILES[task.specialty].display_name})" if not same_specialty else ""
             await agent.say(
                 MessageChannel.GIT,
-                f"Pushed `{commit_result.data['sha']}` to `{owner_branch}`{helping_note}: {result.get('summary', task.title)}",
+                f"Pushed `{commit_result.data['sha']}` to `{git_branch}`{helping_note}: {result.get('summary', task.title)}",
             )
 
         # --- Phase 14 quality gate: syntax-validate what was just written,
@@ -541,7 +592,7 @@ class Orchestrator:
         # logging a failure without acting on it isn't a real quality gate.
         checkable_files = [p for p in result["files"] if Path(p).suffix.lower() in (".py", ".js", ".jsx", ".ts", ".tsx")]
         if checkable_files and commit_result.ok:
-            worktree = git.worktrees_dir / owner_specialty
+            worktree = git.worktrees_dir / git_key
             compile_errors = [f"{rel}:\n{err}" for rel in checkable_files if (err := check_file(worktree, rel))]
             if compile_errors:
                 error_text = "\n\n".join(compile_errors)
@@ -556,11 +607,11 @@ class Orchestrator:
                 )
                 still_broken = list(compile_errors)
                 if fix.get("files"):
-                    fix_commit = git.write_and_commit(owner_specialty, owner_branch, fix["files"], f"Fix syntax error in {task.title}")
+                    fix_commit = git.write_and_commit(git_key, git_branch, fix["files"], f"Fix syntax error in {task.title}")
                     for line in fix_commit.log_lines:
                         await self.bus.emit(EventType.RUN_LOG, actor_id=agent.agent_id, text=line, channel="git")
                     if fix_commit.ok and fix_commit.data.get("sha"):
-                        git.push(owner_specialty, owner_branch or "")
+                        git.push(git_key, git_branch or "")
                         result["files"] = {**result["files"], **fix["files"]}
                         task.files_changed = list(result["files"].keys())
                         still_broken = [
@@ -576,15 +627,23 @@ class Orchestrator:
                     return
                 await agent.say(MessageChannel.TASKS, f"Fixed it — **{task.title}** compiles cleanly now.")
 
+        # --- fold an extra same-specialty instance's branch straight back
+        # into the specialty's one canonical branch (scaling roadmap #4),
+        # immediately -- not just at sprint end. Anyone syncing a
+        # dependency later reads dep_task.branch, which is always the
+        # primary; it needs this instance's work in it right away. ---
+        if is_extra_instance and commit_result.ok and commit_result.data.get("sha"):
+            await self._consolidate_into_primary(context, git, agent, task_specialty, git_branch or "")
+
         # --- self-review, then buddy cross-specialty review (buddy is
         # picked by the task's owning specialty, not the acting agent, so
         # code always gets reviewed by that specialty's real counterpart) ---
         self_review = await agent.review_files(context, task, result["files"])
-        buddy_id = REVIEW_BUDDIES.get(owner_specialty)
+        buddy_id = REVIEW_BUDDIES.get(task_specialty)
         buddy = self.registry.get(buddy_id) if buddy_id else None
         buddy_review = {"approved": True, "findings": []}
         if buddy is not None:
-            await buddy.load_skill(owner_specialty, reason=f"reviewing {agent.identity.display_name}'s change")
+            await buddy.load_skill(task_specialty, reason=f"reviewing {agent.identity.display_name}'s change")
             await self.bus.emit(EventType.REVIEW_REQUESTED, actor_id=agent.agent_id, reviewer=buddy.agent_id, task_id=task.task_id)
             buddy_review = await buddy.review_files(context, task, result["files"])
             findings = buddy_review.get("findings", []) or []
@@ -615,9 +674,31 @@ class Orchestrator:
         # entirely -- can find it via relevant_to() instead of only ever
         # seeing their own direct dependency chain.
         memory.codemap.record_task(
-            specialty=owner_specialty, task_title=task.title,
+            specialty=task_specialty, task_title=task.title,
             summary=result.get("summary", ""), files=result["files"], worktree=owner_worktree,
         )
+
+    async def _consolidate_into_primary(self, context, git, agent: BaseAgent, task_specialty: str, extra_branch: str) -> None:
+        """Scaling roadmap #4: fold an extra same-specialty instance's
+        branch straight back into the specialty's one primary branch,
+        right after each of its commits. Reuses the exact same merge +
+        conflict-resolution path a normal cross-specialty dependency sync
+        uses -- from the primary branch's point of view, absorbing a
+        sibling instance's work isn't fundamentally different from
+        absorbing a dependency's."""
+        sync_result = git.sync_branch(task_specialty, extra_branch)
+        for line in sync_result.log_lines:
+            await self.bus.emit(EventType.RUN_LOG, actor_id=agent.agent_id, text=line, channel="git")
+        if not sync_result.ok and sync_result.data.get("status") == "conflict":
+            stand_in = Task(
+                task_id=f"consolidate-{extra_branch}", story_id="consolidation",
+                title=f"{agent.identity.display_name}'s work", specialty=agent.profile.specialty, branch=extra_branch,
+            )
+            await self._resolve_sync_conflict(context, git, agent, task_specialty, stand_in, sync_result.data.get("conflicted_files", []))
+        primary_branch = PROFILES[agent.profile.specialty].branch or ""
+        push_result = git.push(task_specialty, primary_branch)
+        for line in push_result.log_lines:
+            await self.bus.emit(EventType.RUN_LOG, actor_id=agent.agent_id, text=line, channel="git")
 
     async def _resolve_sync_conflict(self, context, git, agent: BaseAgent, owner_specialty: str, dep_task: Task, conflicted_files: list[str]) -> None:
         await self.bus.emit(
