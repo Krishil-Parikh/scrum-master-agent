@@ -186,6 +186,48 @@ Only include a question if the requirements are genuinely ambiguous or missing i
         await self.set_state(AgentState.IDLE)
         return result
 
+    # ---- Repo retrieval before implementing (scaling roadmap #1) ---------
+
+    async def plan_context_requests(self, context: ProjectContext, task: Task, *, tree: list[str]) -> dict:
+        """Ask the agent what it actually needs to look at in the existing
+        codebase before implementing this task, instead of the orchestrator
+        guessing 1-2 dependency files to truncate and hand over blind. This
+        is deliberately a cheap, small, single JSON call rather than a full
+        multi-turn tool-calling loop (OpenRouter's cheap models are shaky at
+        sustained tool use) -- the agent gets one shot to say what it wants
+        to see, the orchestrator resolves it, then implement_task runs with
+        real answers instead of orchestrator-picked snippets."""
+        if not tree:
+            return {"read_files": [], "grep": [], "search_symbols": []}
+        tree_listing = "\n".join(tree[:150])
+        prompt = f"""
+Task you're about to implement: {task.title}
+{task.description}
+
+Here is everything that currently exists in this codebase (file tree):
+{tree_listing}
+
+Before you write any code, say what you need to look at to avoid duplicating existing code, breaking an existing contract, or missing a naming convention already in use. Return a JSON object:
+{{
+  "read_files": ["exact paths from the tree above you want the full content of, at most 5"],
+  "grep": ["short search terms for things that might exist elsewhere, e.g. a function or endpoint name, at most 3"],
+  "search_symbols": ["short name fragments to look up as functions/classes/routes, at most 3"]
+}}
+If the tree is empty or this task is clearly self-contained and unrelated to anything listed, return empty lists -- don't invent lookups you don't need.
+""".strip()
+        try:
+            result = await self._llm_json(context.name, prompt, max_tokens=400)
+            if not isinstance(result, dict):
+                return {"read_files": [], "grep": [], "search_symbols": []}
+            return {
+                "read_files": [str(p) for p in (result.get("read_files") or [])][:5],
+                "grep": [str(p) for p in (result.get("grep") or [])][:3],
+                "search_symbols": [str(p) for p in (result.get("search_symbols") or [])][:3],
+            }
+        except Exception:
+            logger.exception("%s: plan_context_requests failed for %s", self.agent_id, task.task_id)
+            return {"read_files": [], "grep": [], "search_symbols": []}
+
     # ---- Phase 13/14: implement a task ---------------------------------
 
     async def implement_task(

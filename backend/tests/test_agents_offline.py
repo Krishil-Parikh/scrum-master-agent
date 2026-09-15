@@ -214,6 +214,42 @@ def test_request_work_returns_none_when_nothing_left_anywhere():
     assert sm.request_work(backlog, mlops) is None
 
 
+def test_assemble_backlog_resolves_cross_epic_dependencies():
+    """Hierarchical backlog generation (scaling roadmap #2): epics are
+    generated independently in parallel, so a task in epic 2 depending on a
+    task title from epic 1 must still resolve correctly once everything is
+    assembled together."""
+    sm = ScrumMasterAgent.__new__(ScrumMasterAgent)
+    epics_raw = [
+        {"title": "Auth", "description": "Login"},
+        {"title": "Dashboard", "description": "Main view"},
+    ]
+    epic_results = [
+        {
+            "stories": [{
+                "title": "Login", "tasks": [
+                    {"title": "Create users table", "specialty": "database", "depends_on_task_titles": []},
+                ],
+            }],
+        },
+        {
+            "stories": [{
+                "title": "View dashboard", "tasks": [
+                    {"title": "Dashboard API", "specialty": "backend", "depends_on_task_titles": ["Create users table"]},
+                ],
+            }],
+        },
+    ]
+
+    backlog = sm.assemble_backlog(epics_raw, epic_results)
+
+    assert len(backlog.epics) == 2
+    assert len(backlog.tasks) == 2
+    dashboard_task = next(t for t in backlog.tasks.values() if t.title == "Dashboard API")
+    users_table_task = next(t for t in backlog.tasks.values() if t.title == "Create users table")
+    assert dashboard_task.depends_on == [users_table_task.task_id]
+
+
 def test_needed_specialties_reflects_only_specialties_with_tasks():
     from app.schemas.task import Backlog, Task
     from app.schemas.agent import AgentSpecialty

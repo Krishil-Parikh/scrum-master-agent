@@ -36,6 +36,7 @@ from app.schemas.communication import MessageChannel, SMEQuestion
 from app.schemas.event import EventType
 from app.schemas.project import Decision, ProjectContext
 from app.schemas.task import Backlog, Task, TaskStatus
+from app.tools.code_search import grep, list_tree, read_file_safe, search_symbols
 from app.tools.command_runner import run_command
 
 logger = logging.getLogger("ai_dev_pod.orchestrator")
@@ -279,7 +280,23 @@ class Orchestrator:
 
         sm = self.registry.scrum_master
         await sm.set_state(AgentState.PLANNING)
-        backlog = await sm.generate_backlog(context, sme_context=sme_context)
+
+        # Hierarchical generation (scaling roadmap #2): epics first (one
+        # small call), then stories+tasks per epic, fanned out in parallel
+        # the same way independent analysis already is. Keeps every
+        # individual LLM call small regardless of total project size,
+        # instead of one mega-call risking silent JSON truncation past
+        # ~25 tasks.
+        epics_raw = await sm.generate_epics(context, sme_context=sme_context)
+        if epics_raw:
+            await sm.say(MessageChannel.SCRUM, f"Epics: {', '.join(e['title'] for e in epics_raw)}. Fleshing out stories and tasks for each.")
+            epic_results = await asyncio.gather(
+                *(sm.generate_stories_and_tasks_for_epic(context, e, sme_context=sme_context) for e in epics_raw)
+            )
+        else:
+            epic_results = []
+        backlog = sm.assemble_backlog(epics_raw, list(epic_results))
+
         memory.save_backlog(backlog)
         memory.md.write_agile_md(backlog)
         await sm.say(
@@ -426,6 +443,35 @@ class Orchestrator:
 
         if task.blocked_reason:
             dep_context += f"\n\nThis task was previously blocked and is being retried: {task.blocked_reason}\nMake sure your implementation actually resolves that."
+
+        # --- let the agent look around the real codebase before writing
+        # (scaling roadmap #1): ask what it needs, resolve those requests
+        # against the actual worktree, and hand back real answers instead
+        # of the orchestrator guessing which 1-2 files to truncate. ---
+        owner_worktree = git.worktrees_dir / owner_specialty
+        tree = list_tree(owner_worktree) if owner_worktree.exists() else []
+        if tree:
+            requests = await agent.plan_context_requests(context, task, tree=tree)
+            lookup_parts = []
+            for rel_path in requests.get("read_files", []):
+                content = read_file_safe(owner_worktree, rel_path, max_chars=3000)
+                lookup_parts.append(f"--- {rel_path} ---\n{content}")
+            for term in requests.get("grep", []):
+                matches = grep(owner_worktree, term, max_matches=15)
+                if matches:
+                    lookup_parts.append(f"grep '{term}':\n" + "\n".join(matches))
+            for term in requests.get("search_symbols", []):
+                matches = search_symbols(owner_worktree, term, max_matches=15)
+                if matches:
+                    lookup_parts.append(f"symbols matching '{term}':\n" + "\n".join(matches))
+            if lookup_parts:
+                dep_context += "\n\nYou asked to look at the existing codebase first -- here's what's actually there:\n" + "\n\n".join(lookup_parts)
+                await agent.say(
+                    MessageChannel.SYSTEM,
+                    f"Looked at the existing codebase before starting **{task.title}** "
+                    f"({len(requests.get('read_files', []))} file(s), {len(requests.get('grep', []))} grep, "
+                    f"{len(requests.get('search_symbols', []))} symbol lookup(s)).",
+                )
 
         # --- implement (use the TASK's specialty skill when helping, not
         # the acting agent's own -- e.g. Frontend covering a Backend task

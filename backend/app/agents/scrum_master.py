@@ -13,7 +13,6 @@ import logging
 
 from app.agents.base import BaseAgent
 from app.agents.profiles import DEVELOPER_SPECIALTIES, PROFILES
-from app.llm.prompts import truncate
 from app.schemas.agent import AgentSpecialty
 from app.schemas.project import ProjectContext
 from app.schemas.task import Backlog, Epic, Sprint, Task, TaskRisk, TaskStatus, UserStory
@@ -28,9 +27,21 @@ class ScrumMasterAgent(BaseAgent):
     def __init__(self):
         super().__init__(PROFILES[AgentSpecialty.SCRUM_MASTER])
 
-    # ---- Phase 7: Agile planning ----------------------------------------
+    # ---- Phase 7: Agile planning (hierarchical -- scaling roadmap #2) ----
+    #
+    # Backlog generation used to be one mega LLM call asking for the entire
+    # Epic -> Story -> Task tree at once (up to ~25 tasks nested three deep
+    # in one JSON response). That's a known failure mode for large
+    # structured output: past a certain size the JSON silently truncates
+    # mid-array, and the caller has no way to tell "the model stopped
+    # early" from "the model decided this project only needs 6 tasks."
+    # Splitting into "epics first, then stories+tasks per epic in parallel"
+    # keeps every individual call small regardless of total project size --
+    # 10 epics means 10 small calls (fanned out the same way independent
+    # analysis already does), not one call trying to hold everything.
 
-    async def generate_backlog(self, context: ProjectContext, sme_context: str = "") -> Backlog:
+    async def generate_epics(self, context: ProjectContext, sme_context: str = "") -> list[dict]:
+        """Step 1 of 2: just the top-level breakdown, no stories/tasks yet."""
         requirements_text = "\n".join(f"- [{r.kind}] {r.text}" for r in context.requirements)
         decisions_text = "\n".join(f"- {d.decision}" for d in context.decisions)
         prompt = f"""
@@ -45,47 +56,119 @@ Confirmed decisions from SME clarification:
 {decisions_text or "(none yet)"}
 {sme_context}
 
-Break this project into Epics -> User Stories -> Tasks. Every task MUST be assigned a "specialty" from exactly this set: frontend, backend, ai_ml, devops, mlops, database.
+Break this project into 3-6 Epics -- the top-level chunks of work only, not individual stories or tasks yet.
 
-Decide for yourself which of those six specialties this specific project actually needs -- do not invent filler work for a specialty just to keep it represented. A small CRUD app might genuinely only need frontend, backend, and database; it does not need an ai_ml or mlops task just because those roles exist on the pod. Only include devops, ai_ml, or mlops tasks when the requirements actually call for them (e.g. no AI/ML task unless the project has an AI-powered feature; no dedicated devops task unless deployment/CI is in scope beyond what backend already covers). Specialties with no real work this project needs should simply have zero tasks -- the pod will have those developers help wherever the work actually is instead.
+Decide for yourself which specialties (frontend, backend, ai_ml, devops, mlops, database) this project actually needs -- do not shape an epic around a specialty just to keep it represented. A small CRUD app might genuinely only need frontend, backend, and database epics.
+
+Return a JSON object:
+{{"epics": [{{"title": "...", "description": "1-2 sentences on what this epic covers"}}]}}
+""".strip()
+        raw = await self._llm_json(context.name, prompt, max_tokens=800)
+        epics = raw.get("epics", []) if isinstance(raw, dict) else []
+        return [e for e in epics if isinstance(e, dict) and e.get("title")]
+
+    async def generate_stories_and_tasks_for_epic(self, context: ProjectContext, epic: dict, sme_context: str = "") -> dict:
+        """Step 2 of 2: fill in ONE epic's stories and tasks. Called once
+        per epic, in parallel (see the orchestrator's agile-planning
+        phase), so each call stays small no matter how many epics there
+        are in total."""
+        requirements_text = "\n".join(f"- [{r.kind}] {r.text}" for r in context.requirements)
+        prompt = f"""
+Project: {context.name}
+Objective: {context.objective}
+
+Requirements:
+{requirements_text or "(none captured)"}
+{sme_context}
+
+Epic: {epic.get('title', 'Untitled Epic')}
+{epic.get('description', '')}
+
+Break this ONE epic into User Stories, each broken into technical Tasks. Every task MUST be assigned a "specialty" from exactly this set: frontend, backend, ai_ml, devops, mlops, database -- only a specialty this epic genuinely needs, don't invent filler tasks to represent one that isn't relevant here.
 
 Return a JSON object:
 {{
-  "epics": [
+  "stories": [
     {{
-      "title": "...",
-      "description": "...",
-      "stories": [
+      "title": "...", "as_a": "user", "i_want": "...", "so_that": "...",
+      "acceptance_criteria": ["..."],
+      "tasks": [
         {{
-          "title": "...",
-          "as_a": "user",
-          "i_want": "...",
-          "so_that": "...",
+          "title": "...", "description": "...",
+          "specialty": "frontend|backend|ai_ml|devops|mlops|database",
+          "risk": "low|medium|high",
           "acceptance_criteria": ["..."],
-          "tasks": [
-            {{
-              "title": "...",
-              "description": "...",
-              "specialty": "frontend|backend|ai_ml|devops|mlops|database",
-              "risk": "low|medium|high",
-              "acceptance_criteria": ["..."],
-              "depends_on_task_titles": ["exact title of another task in this same response, if any"]
-            }}
-          ]
+          "depends_on_task_titles": ["exact title of another task -- from this epic or a different one -- if any"]
         }}
       ]
     }}
   ]
 }}
-
-Produce 3-5 epics covering the full project, sized to what the project actually needs -- keep task titles short and unique across the whole backlog so dependencies can reference them unambiguously. Aim for roughly 10-25 tasks total depending on real scope, not a fixed count.
+Keep task titles short and globally unique across the whole project (another epic's task may need to reference yours as a dependency, and vice versa). Aim for 2-5 stories for this one epic, sized to what it actually needs.
 """.strip()
-        # This is the single largest structured-output call in the whole
-        # pipeline (up to ~25 tasks nested in stories/epics) -- give it a
-        # generous token budget so the JSON doesn't get cut off mid-object,
-        # which would otherwise fail to parse at all rather than degrading.
-        raw = await self._llm_json(context.name, prompt, max_tokens=5000)
-        return _parse_backlog(raw)
+        try:
+            raw = await self._llm_json(context.name, prompt, max_tokens=2200)
+            return raw if isinstance(raw, dict) else {"stories": []}
+        except Exception:
+            logger.exception("generate_stories_and_tasks_for_epic failed for epic %r", epic.get("title"))
+            return {"stories": []}
+
+    def assemble_backlog(self, epics_raw: list[dict], epic_results: list[dict]) -> Backlog:
+        """Combine per-epic story/task JSON (generated independently, in
+        parallel) into one Backlog, resolving dependency references
+        globally at the end -- a task in epic 3 can legitimately depend on
+        a task title from epic 1, so title->id resolution has to happen
+        after every epic's results are in, not per-epic."""
+        backlog = Backlog()
+        title_to_id: dict[str, str] = {}
+        pending_deps: list[tuple[Task, list[str]]] = []
+
+        for epic_raw, epic_result in zip(epics_raw, epic_results):
+            epic_id = new_id("epic")
+            epic = Epic(epic_id=epic_id, title=epic_raw.get("title", "Untitled Epic"), description=epic_raw.get("description", ""))
+            for story_raw in (epic_result.get("stories") or []):
+                if not isinstance(story_raw, dict):
+                    continue
+                story_id = new_id("story")
+                story = UserStory(
+                    story_id=story_id,
+                    epic_id=epic_id,
+                    title=story_raw.get("title", "Untitled Story"),
+                    as_a=story_raw.get("as_a", "user"),
+                    i_want=story_raw.get("i_want", ""),
+                    so_that=story_raw.get("so_that", ""),
+                    acceptance_criteria=story_raw.get("acceptance_criteria", []) or [],
+                )
+                for task_raw in (story_raw.get("tasks") or []):
+                    if not isinstance(task_raw, dict):
+                        continue
+                    specialty_raw = str(task_raw.get("specialty", "")).strip().lower()
+                    if specialty_raw not in _VALID_SPECIALTIES:
+                        specialty_raw = "backend"  # safe default rather than dropping the task
+                    risk_raw = str(task_raw.get("risk", "low")).strip().lower()
+                    if risk_raw not in ("low", "medium", "high"):
+                        risk_raw = "low"
+                    task = Task(
+                        task_id=new_id("task"),
+                        story_id=story_id,
+                        title=task_raw.get("title", "Untitled Task"),
+                        description=task_raw.get("description", ""),
+                        specialty=AgentSpecialty(specialty_raw),
+                        risk=TaskRisk(risk_raw),
+                        acceptance_criteria=task_raw.get("acceptance_criteria", []) or [],
+                    )
+                    title_to_id[task.title] = task.task_id
+                    pending_deps.append((task, task_raw.get("depends_on_task_titles", []) or []))
+                    backlog.tasks[task.task_id] = task
+                    story.task_ids.append(task.task_id)
+                backlog.stories[story_id] = story
+                epic.story_ids.append(story_id)
+            backlog.epics[epic_id] = epic
+
+        for task, dep_titles in pending_deps:
+            task.depends_on = [title_to_id[t] for t in dep_titles if t in title_to_id and title_to_id[t] != task.task_id]
+
+        return backlog
 
     # ---- Phase 8: task allocation -----------------------------------------
 
@@ -224,53 +307,3 @@ Write a concise sprint review summary (3-5 sentences) for the Business SME/Produ
         went_wrong = _dedupe([w for i in inputs for w in i.get("went_wrong", [])])
         action_items = _dedupe([a for i in inputs for a in i.get("action_items", [])])
         return {"went_well": went_well, "went_wrong": went_wrong, "action_items": action_items}
-
-
-def _parse_backlog(raw: dict) -> Backlog:
-    backlog = Backlog()
-    title_to_id: dict[str, str] = {}
-    pending_deps: list[tuple[Task, list[str]]] = []
-
-    epics = raw.get("epics", []) if isinstance(raw, dict) else []
-    for epic_raw in epics:
-        epic_id = new_id("epic")
-        epic = Epic(epic_id=epic_id, title=epic_raw.get("title", "Untitled Epic"), description=epic_raw.get("description", ""))
-        for story_raw in epic_raw.get("stories", []):
-            story_id = new_id("story")
-            story = UserStory(
-                story_id=story_id,
-                epic_id=epic_id,
-                title=story_raw.get("title", "Untitled Story"),
-                as_a=story_raw.get("as_a", "user"),
-                i_want=story_raw.get("i_want", ""),
-                so_that=story_raw.get("so_that", ""),
-                acceptance_criteria=story_raw.get("acceptance_criteria", []) or [],
-            )
-            for task_raw in story_raw.get("tasks", []):
-                specialty_raw = str(task_raw.get("specialty", "")).strip().lower()
-                if specialty_raw not in _VALID_SPECIALTIES:
-                    specialty_raw = "backend"  # safe default rather than dropping the task
-                risk_raw = str(task_raw.get("risk", "low")).strip().lower()
-                if risk_raw not in ("low", "medium", "high"):
-                    risk_raw = "low"
-                task = Task(
-                    task_id=new_id("task"),
-                    story_id=story_id,
-                    title=task_raw.get("title", "Untitled Task"),
-                    description=task_raw.get("description", ""),
-                    specialty=AgentSpecialty(specialty_raw),
-                    risk=TaskRisk(risk_raw),
-                    acceptance_criteria=task_raw.get("acceptance_criteria", []) or [],
-                )
-                title_to_id[task.title] = task.task_id
-                pending_deps.append((task, task_raw.get("depends_on_task_titles", []) or []))
-                backlog.tasks[task.task_id] = task
-                story.task_ids.append(task.task_id)
-            backlog.stories[story_id] = story
-            epic.story_ids.append(story_id)
-        backlog.epics[epic_id] = epic
-
-    for task, dep_titles in pending_deps:
-        task.depends_on = [title_to_id[t] for t in dep_titles if t in title_to_id and title_to_id[t] != task.task_id]
-
-    return backlog
