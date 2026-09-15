@@ -17,6 +17,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from app.config import PROJECT_DATA_DIR
+from app.memory.codemap import Codemap
 from app.memory.markdown_store import MarkdownStore
 from app.memory.project_context import AgentStatusStore, BacklogStore, ProjectContextStore
 from app.schemas.agent import AgentStatus
@@ -38,6 +39,7 @@ class ProjectMemory:
         self.backlog_store = BacklogStore(self.base_dir / "backlog.json")
         self.agent_status_store = AgentStatusStore(self.base_dir / "agents.json")
         self.md = MarkdownStore(self.base_dir / "docs")
+        self.codemap = Codemap(self.base_dir / "codemap.json")
 
         self.events_path = self.base_dir / "events.jsonl"
         self.messages_path = self.base_dir / "messages.jsonl"

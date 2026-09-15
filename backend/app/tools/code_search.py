@@ -129,7 +129,7 @@ class Symbol:
     line: int
 
 
-def _symbols_in_file(path: Path, rel: str) -> list[Symbol]:
+def symbols_in_file(path: Path, rel: str) -> list[Symbol]:
     out: list[Symbol] = []
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -164,7 +164,7 @@ def search_symbols(root: Path, query: str, *, max_matches: int = _MAX_SYMBOL_MAT
     results: list[str] = []
     for path in _iter_source_files(root):
         rel = str(path.relative_to(root)).replace("\\", "/")
-        for sym in _symbols_in_file(path, rel):
+        for sym in symbols_in_file(path, rel):
             if query_lower in sym.name.lower():
                 results.append(f"{sym.kind} {sym.name}  ({sym.file}:{sym.line})")
                 if len(results) >= max_matches:

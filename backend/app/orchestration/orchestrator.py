@@ -473,6 +473,17 @@ class Orchestrator:
                     f"{len(requests.get('search_symbols', []))} symbol lookup(s)).",
                 )
 
+        # --- project-wide memory graph (scaling roadmap #3): what has
+        # already been built elsewhere in this project that's relevant to
+        # this task, beyond just its direct dependency chain. Cheap lookup
+        # (specialty + keyword match, no LLM call) against the codemap
+        # every completed task updates itself into. ---
+        codemap_keywords = [task.title, *task.description.split()]
+        codemap_hits = memory.codemap.relevant_to(specialty=owner_specialty, keywords=codemap_keywords, max_entries=6)
+        codemap_text = memory.codemap.render(codemap_hits)
+        if codemap_text:
+            dep_context += "\n\nRelevant existing code elsewhere in this project (from the project codemap):\n" + codemap_text
+
         # --- implement (use the TASK's specialty skill when helping, not
         # the acting agent's own -- e.g. Frontend covering a Backend task
         # should be guided by Backend's skill body) ---
@@ -599,6 +610,15 @@ class Orchestrator:
         task.touch()
         await agent.set_state(AgentState.COMPLETED, note=task.title)
         await self.bus.emit(EventType.TASK_COMPLETED, actor_id=agent.agent_id, task_id=task.task_id, title=task.title)
+
+        # Record what just got built into the project codemap (scaling
+        # roadmap #3) so future tasks -- possibly by a different agent
+        # entirely -- can find it via relevant_to() instead of only ever
+        # seeing their own direct dependency chain.
+        memory.codemap.record_task(
+            specialty=owner_specialty, task_title=task.title,
+            summary=result.get("summary", ""), files=result["files"], worktree=owner_worktree,
+        )
 
     async def _resolve_sync_conflict(self, context, git, agent: BaseAgent, owner_specialty: str, dep_task: Task, conflicted_files: list[str]) -> None:
         await self.bus.emit(
